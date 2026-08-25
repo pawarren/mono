@@ -309,7 +309,7 @@ export function clientMap(
   return withDagRead(delegate, async dagRead => {
     const tree = await getBTree(dagRead, clientID);
     const map = new Map<string, ReadonlyJSONValue>();
-    for await (const [key, value] of tree.scan('')) {
+    for await (const [key, value] of tree.scan('', true)) {
       map.set(key, value);
     }
     return map;
@@ -325,7 +325,7 @@ export function clientRows(
     const prefix = ENTITIES_KEY_PREFIX + tableName + '/';
     const tree = await getBTree(dagRead, clientID);
     const rows: Row[] = [];
-    for await (const [key, value] of tree.scan(prefix)) {
+    for await (const [key, value] of tree.scan(prefix, true)) {
       if (!key.startsWith(prefix)) {
         break;
       }
