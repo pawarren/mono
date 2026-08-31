@@ -4,12 +4,16 @@ import {resolver, type Resolver} from '@rocicorp/resolver';
 import {type PendingQuery, type Row} from 'postgres';
 import {AbortError} from '../../../../shared/src/abort-error.ts';
 import {assert, unreachable} from '../../../../shared/src/asserts.ts';
+import {
+  BigIntJSON,
+  type JSONObject,
+} from '../../../../shared/src/bigint-json.ts';
 import {Queue} from '../../../../shared/src/queue.ts';
 import {promiseVoid} from '../../../../shared/src/resolved-promises.ts';
 import * as v from '../../../../shared/src/valita.ts';
 import * as Mode from '../../db/mode-enum.ts';
 import {runTx} from '../../db/run-transaction.ts';
-import {TransactionPool} from '../../db/transaction-pool.ts';
+import {sharedSnapshot, TransactionPool} from '../../db/transaction-pool.ts';
 import {type PostgresDB, type PostgresTransaction} from '../../types/pg.ts';
 import {cdcSchema, type ShardID} from '../../types/shards.ts';
 import {orTimeout} from '../../types/timeout.ts';
@@ -53,6 +57,15 @@ import {
   type TableMetadataRow,
 } from './schema/tables.ts';
 import type {Subscriber} from './subscriber.ts';
+
+/**
+ * Factory for creating dynamic connection pools used by the Storer to
+ * isolate concurrent transactions into separate pg clients.
+ */
+export type PostgresDBProvider = (
+  applicationName: string,
+  maxConns: number,
+) => PostgresDB;
 
 type SubscriberAndMode = {
   subscriber: Subscriber;
@@ -145,7 +158,15 @@ export class Storer implements Service {
   readonly #taskID: string;
   readonly #discoveryAddress: string;
   readonly #discoveryProtocol: string;
+  readonly #makeConnectionPool: PostgresDBProvider;
+
+  // Isolated connection pools for steady-state, potentially concurrent
+  // queries, in order to avoid a postgres.js connection-swapping bug:
+  // https://github.com/porsager/postgres/issues/1204
   readonly #db: PostgresDB;
+  readonly #inserter: PostgresDB;
+  readonly #purger: PostgresDB;
+
   readonly #replicaVersion: string;
   readonly #onCommitted: (c: Commit) => void;
   readonly #onFatal: (err: Error) => void;
@@ -154,6 +175,7 @@ export class Storer implements Service {
   readonly #statementTimeoutMs: number;
   readonly #changeLogBatchSize: number;
   readonly #drainTimeoutMs: number;
+  readonly #progressMonitor: ProgressMonitor;
 
   #approximateQueuedBytes = 0;
   #running = false;
@@ -164,7 +186,7 @@ export class Storer implements Service {
     taskID: string,
     discoveryAddress: string,
     discoveryProtocol: string,
-    db: PostgresDB,
+    dbProvider: PostgresDBProvider,
     replicaVersion: string,
     onCommitted: (c: Commit | UpstreamStatusMessage) => void,
     onFatal: (err: Error) => void,
@@ -180,13 +202,21 @@ export class Storer implements Service {
     this.#taskID = taskID;
     this.#discoveryAddress = discoveryAddress;
     this.#discoveryProtocol = discoveryProtocol;
-    this.#db = db;
+    this.#makeConnectionPool = dbProvider;
+    this.#db = dbProvider('change-stream-init', 3);
+    this.#inserter = dbProvider('change-log-inserter', 1);
+    this.#purger = dbProvider('change-log-purger', 1);
     this.#replicaVersion = replicaVersion;
     this.#onCommitted = onCommitted;
     this.#onFatal = onFatal;
     this.#statementTimeoutMs = statementTimeoutMs;
     this.#changeLogBatchSize = Math.max(1, changeLogBatchSize);
     this.#drainTimeoutMs = drainTimeoutMs;
+    this.#progressMonitor = new ProgressMonitor(
+      lc,
+      statementTimeoutMs,
+      onFatal,
+    );
 
     const heapStats = getHeapStatistics();
     this.#backPressureThresholdBytes =
@@ -206,6 +236,31 @@ export class Storer implements Service {
     return this.#db(`${cdcSchema(this.#shard)}.${table}`);
   }
 
+  /**
+   * Bounds a one-off db call (i.e. not part of the main storer loop or the
+   * background catchup read, which are tracked by the ProgressMonitor
+   * instead) with a plain timeout. This covers calls like
+   * {@link assumeOwnership} and {@link getStartStreamInitializationParameters}
+   * that are made by the caller *before* {@link run()} -- and thus before the
+   * ProgressMonitor's polling starts -- as well as ones made well after,
+   * where a continuously-polling watchdog would be overkill for a single
+   * bounded db round trip.
+   *
+   * Does not cancel `promise` on timeout (there is no cancellation mechanism
+   * for a postgres.js query); it just stops waiting for it, and swallows a
+   * later rejection so it doesn't surface as an unhandled rejection.
+   */
+  async #withTimeout<T>(name: string, promise: Promise<T>): Promise<T> {
+    const result = await orTimeout(promise, this.#statementTimeoutMs);
+    if (result === 'timed-out') {
+      void promise.catch(() => {});
+      throw new AbortError(
+        `${name} did not complete within ${this.#statementTimeoutMs}ms`,
+      );
+    }
+    return result;
+  }
+
   async assumeOwnership(purgeLock?: PurgeLock | null) {
     const db = this.#db;
     const owner = this.#taskID;
@@ -218,7 +273,10 @@ export class Storer implements Service {
         : `${ownerProtocol}://${ownerAddress}`;
     this.#lc.info?.(`assuming ownership at ${addressWithProtocol}`);
     const start = performance.now();
-    await db`UPDATE ${this.#cdc('replicationState')} SET ${db({owner, ownerAddress: addressWithProtocol})}`;
+    await this.#withTimeout(
+      'assume-ownership',
+      db`UPDATE ${this.#cdc('replicationState')} SET ${db({owner, ownerAddress: addressWithProtocol})}`,
+    );
     const elapsed = (performance.now() - start).toFixed(2);
     this.#lc.info?.(
       `assumed ownership at ${addressWithProtocol} (${elapsed} ms)`,
@@ -255,16 +313,19 @@ export class Storer implements Service {
     backfillRequests: BackfillRequest[];
     cookies: CookieSet;
   }> {
-    const [[{lastWatermark}], result, tableMetadata, backfilling] = await runTx(
-      this.#db,
-      sql => [
-        sql<{lastWatermark: string}[]>`
+    const [[{lastWatermark}], result, tableMetadata, backfilling] =
+      await this.#withTimeout(
+        'get-stream-params',
+        runTx(
+          this.#db,
+          sql => [
+            sql<{lastWatermark: string}[]>`
         SELECT "lastWatermark" FROM ${this.#cdc('replicationState')}`,
 
-        // Formats a BackfillRequest using json_object_agg() to construct the
-        // `columns` object. It is LEFT JOIN'ed with the `tableMetadata` table
-        // to make it optional and possibly `null`.
-        sql`
+            // Formats a BackfillRequest using json_object_agg() to construct the
+            // `columns` object. It is LEFT JOIN'ed with the `tableMetadata` table
+            // to make it optional and possibly `null`.
+            sql`
         SELECT
             json_build_object(
               'schema', b."schema",
@@ -279,22 +340,23 @@ export class Storer implements Service {
           GROUP BY b."schema", b."table", t."metadata"
         `,
 
-        // Ordered by primary key, so that this set and the SQLite change log's
-        // can be compared row for row. `COLLATE "C"` because that comparison is
-        // against a store whose TEXT columns sort by byte: a linguistic
-        // collation orders `foo-bar` and `foobar` differently than SQLite's
-        // BINARY does, which would read as a divergence rather than as the
-        // identical set it is.
-        sql<TableMetadataCookie[]>`
+            // Ordered by primary key, so that this set and the SQLite change log's
+            // can be compared row for row. `COLLATE "C"` because that comparison is
+            // against a store whose TEXT columns sort by byte: a linguistic
+            // collation orders `foo-bar` and `foobar` differently than SQLite's
+            // BINARY does, which would read as a divergence rather than as the
+            // identical set it is.
+            sql<TableMetadataCookie[]>`
         SELECT "schema", "table", "metadata" FROM ${this.#cdc('tableMetadata')}
           ORDER BY "schema" COLLATE "C", "table" COLLATE "C"`,
 
-        sql<BackfillCookie[]>`
+            sql<BackfillCookie[]>`
         SELECT "schema", "table", "column", "backfill" FROM ${this.#cdc('backfilling')}
           ORDER BY "schema" COLLATE "C", "table" COLLATE "C", "column" COLLATE "C"`,
-      ],
-      {mode: Mode.READONLY},
-    );
+          ],
+          {mode: Mode.READONLY},
+        ),
+      );
 
     return {
       lastWatermark,
@@ -307,9 +369,11 @@ export class Storer implements Service {
   }
 
   async getMinWatermarkForCatchup(): Promise<string | null> {
-    const [{minWatermark}] = await this.#db<{minWatermark: string | null}[]>
-    /*sql*/ `
-      SELECT min(watermark) as "minWatermark" FROM ${this.#cdc('changeLog')}`;
+    const [{minWatermark}] = await this.#withTimeout(
+      'get-min-watermark',
+      this.#db<{minWatermark: string | null}[]> /*sql*/ `
+      SELECT min(watermark) as "minWatermark" FROM ${this.#cdc('changeLog')}`,
+    );
     return minWatermark;
   }
 
@@ -322,12 +386,13 @@ export class Storer implements Service {
     minWatermark: string | null;
     lastWatermark: string;
   }> {
-    const [bounds] = await this.#db<
-      {minWatermark: string | null; lastWatermark: string}[]
-    > /*sql*/ `
+    const [bounds] = await this.#withTimeout(
+      'get-catchup-bounds',
+      this.#db<{minWatermark: string | null; lastWatermark: string}[]> /*sql*/ `
       SELECT
         (SELECT min(watermark) FROM ${this.#cdc('changeLog')}) as "minWatermark",
-        (SELECT "lastWatermark" FROM ${this.#cdc('replicationState')}) as "lastWatermark"`;
+        (SELECT "lastWatermark" FROM ${this.#cdc('replicationState')}) as "lastWatermark"`,
+    );
     return bounds;
   }
 
@@ -375,8 +440,12 @@ export class Storer implements Service {
     >;
   }
 
+  // Note: These are the only db `await`s that are not tracked by the
+  //       ProgressMonitor, as the delete can legitimately block and/or take
+  //       an arbitrary amount of time. Luckily, this is a background call and
+  //       thus cannot cause the storer loop to hang.
   purgeRecordsBefore(watermark: string): Promise<number> {
-    return runTx(this.#db, async sql => {
+    return runTx(this.#purger, async sql => {
       // This NOWAIT pre-check is an optimization to abort the transaction
       // (and release associated resources) early.
       await sql<{watermark: string}[]>`
@@ -446,7 +515,6 @@ export class Storer implements Service {
   }
 
   #readyForMore: Resolver<void> | null = null;
-  #backpressureTimeout: NodeJS.Timeout | undefined;
 
   readyForMore(): Promise<void> | undefined {
     if (!this.#running) {
@@ -470,23 +538,8 @@ export class Storer implements Service {
           `  LIMIT 20;`,
       );
       this.#readyForMore = resolver();
-      this.#resetBackpressureTimeout(true);
     }
     return this.#readyForMore?.promise;
-  }
-
-  #resetBackpressureTimeout(reschedule: boolean) {
-    clearTimeout(this.#backpressureTimeout);
-    this.#backpressureTimeout = reschedule
-      ? setTimeout(() => {
-          this.#readyForMore?.reject(
-            new AbortError(
-              `No statement processed within the last ${this.#statementTimeoutMs}ms. Considering the change-log to be wedged.`,
-            ),
-          );
-          this.#readyForMore = null;
-        }, this.#statementTimeoutMs)
-      : undefined;
   }
 
   #maybeReleaseBackPressure() {
@@ -501,9 +554,6 @@ export class Storer implements Service {
         );
         this.#readyForMore.resolve();
         this.#readyForMore = null;
-        this.#resetBackpressureTimeout(false);
-      } else {
-        this.#resetBackpressureTimeout(true);
       }
     }
   }
@@ -553,6 +603,7 @@ export class Storer implements Service {
     this.#stopped = stopped;
 
     this.#lc.info?.('starting storer');
+    this.#progressMonitor.start(); // Note: This is stopped in stop()
     let err: unknown;
     try {
       await this.#processQueue();
@@ -565,7 +616,6 @@ export class Storer implements Service {
         this.#readyForMore.resolve();
         this.#readyForMore = null;
       }
-      this.#resetBackpressureTimeout(false);
       this.#cancelQueueEntries(
         this.#queue.drain().filter(entry => entry !== undefined),
         err,
@@ -606,9 +656,27 @@ export class Storer implements Service {
     let tx: PendingTransaction | null = null;
     let msg: QueueEntry | false;
 
+    // Track the progress of each (previous and next) queue entry before it is
+    // processed in the loop.
+    let lastTaskDone: TaskDoneFn | undefined;
+    const nextMessage = async () => {
+      lastTaskDone?.();
+      lastTaskDone = undefined;
+      const entry = await this.#queue.dequeue();
+      if (entry !== 'stop') {
+        lastTaskDone = this.#progressMonitor.trackTask({
+          task: 'queue-entry',
+          // Note: TaskKeys are logged, so only include entry[0] (the type) to
+          // avoid logging application data.
+          type: entry[0],
+        });
+      }
+      return entry;
+    };
+
     const catchupQueue: SubscriberAndMode[] = [];
     try {
-      while ((msg = await this.#queue.dequeue()) !== 'stop') {
+      while ((msg = await nextMessage()) !== 'stop') {
         const [msgType] = msg;
         switch (msgType) {
           case 'ready': {
@@ -646,10 +714,7 @@ export class Storer implements Service {
           tx = {
             pool: new TransactionPool(
               this.#lc.withContext('watermark', watermark),
-              {
-                mode: Mode.READ_COMMITTED,
-                statementResponseTimeout: this.#statementTimeoutMs,
-              },
+              {mode: Mode.READ_COMMITTED},
             ),
             preCommitWatermark: watermark,
             pos: 0,
@@ -658,7 +723,7 @@ export class Storer implements Service {
             batch: [],
             lastFlush: undefined,
           };
-          tx.pool.run(this.#db);
+          tx.pool.run(this.#inserter);
           // Acquire a lock on the replicationState row to detect and/or prevent
           // a concurrent ownership change.
           void tx.pool.process(tx => {
@@ -765,18 +830,33 @@ export class Storer implements Service {
   }
 
   async #startCatchup(subs: SubscriberAndMode[]) {
-    if (subs.length === 0) {
+    const numCatchups = subs.length;
+    if (numCatchups === 0) {
       return;
     }
 
     const lc = this.#lc.withContext('pool', 'catchup');
-    // TODO: Consider setting initialWorkers to accomodate parallel
-    //       catchups of multiple subscribers. The tricky part is
-    //       staying within the db's max connections.
-    const reader = new TransactionPool(lc, {mode: Mode.READONLY});
-    reader.run(this.#db);
+    const {init, cleanup, snapshotID} = sharedSnapshot();
+    const reader = new TransactionPool(lc, {
+      mode: Mode.READONLY,
+      init,
+      cleanup,
+      initialWorkers: subs.length,
+    });
+
+    // A dynamic connection pool is created for catchup, sized to the number
+    // of subscribers being caught up.
+    const catchupConns = this.#makeConnectionPool(
+      'subscriber-catchup',
+      numCatchups,
+    );
+    reader.run(catchupConns);
 
     let lastWatermark: string | undefined;
+    const catchupSnapshotted = this.#progressMonitor.trackTask({
+      task: 'capture-catchup-snapshot',
+      subscribers: subs.map(({subscriber: s}) => s.id),
+    });
     try {
       // Ensure that the transaction has started (and is thus holding a snapshot
       // of the database) before continuing on to commit more changes. This is
@@ -787,14 +867,20 @@ export class Storer implements Service {
         SELECT "lastWatermark" FROM ${this.#cdc('replicationState')}
       `,
       );
+      lc.info?.(
+        `snapshotted db at ${lastWatermark} (${await snapshotID}) ` +
+          `to catchup ${numCatchups} subscriber(s)`,
+      );
     } catch (e) {
       subs.map(({subscriber}) => subscriber.fail(e));
       throw e;
+    } finally {
+      catchupSnapshotted();
     }
 
     // Run the actual catchup queries in the background. Errors are handled in
     // #catchup() by disconnecting the associated subscriber.
-    void Promise.all(
+    void Promise.allSettled(
       subs.map(sub =>
         this.#catchup(
           lc.withContext('subscriber', sub.subscriber.id),
@@ -803,7 +889,10 @@ export class Storer implements Service {
           reader,
         ),
       ),
-    ).finally(() => reader.setDone());
+    ).finally(() => {
+      reader.setDone();
+      void catchupConns.end().catch(() => {});
+    });
   }
 
   async #catchup(
@@ -812,6 +901,12 @@ export class Storer implements Service {
     lastWatermark: string,
     reader: TransactionPool,
   ) {
+    let entriesReceived = 0;
+    let catchupProgressed = this.#progressMonitor.trackTask({
+      task: 'catchup',
+      subscriber: sub.id,
+      entriesReceived,
+    });
     try {
       lc.info?.(`starting catchup`);
       await reader.processReadTask(async tx => {
@@ -829,47 +924,61 @@ export class Storer implements Service {
            WHERE watermark >= ${sub.watermark}
              AND watermark <= ${lastWatermark}
            ORDER BY watermark, pos`.cursor(2000)) {
-          // Wait for the last batch of entries to be consumed by the
-          // subscriber before sending down the current batch. This pipelining
-          // allows one batch of changes to be received from the change-db
-          // while the previous batch of changes are sent to the subscriber,
-          // resulting in flow control that caps the number of changes
-          // referenced in memory to 2 * batch-size.
-          const start = performance.now();
-          await lastBatchConsumed;
-          const elapsed = performance.now() - start;
-          if (lastBatchConsumed) {
-            lc[elapsed > 100 ? 'info' : 'debug']?.(
-              `waited ${elapsed.toFixed(3)} ms for ${sub.id} to consume last batch of catchup entries`,
-            );
-          }
+          catchupProgressed();
+          entriesReceived += entries.length;
 
-          for (const entry of entries) {
-            if (entry.watermark === sub.watermark) {
-              // This should be the first entry.
-              // Catchup starts from *after* the watermark.
-              watermarkFound = true;
-            } else if (watermarkFound) {
-              lastBatchConsumed = sub.catchup(
-                reconstructWatermarkedChange(entry),
+          try {
+            // Wait for the last batch of entries to be consumed by the
+            // subscriber before sending down the current batch. This pipelining
+            // allows one batch of changes to be received from the change-db
+            // while the previous batch of changes are sent to the subscriber,
+            // resulting in flow control that caps the number of changes
+            // referenced in memory to 2 * batch-size.
+            const start = performance.now();
+            await lastBatchConsumed;
+            const elapsed = performance.now() - start;
+            if (lastBatchConsumed) {
+              lc[elapsed > 100 ? 'info' : 'debug']?.(
+                `waited ${elapsed.toFixed(3)} ms for ${sub.id} to consume last batch of catchup entries`,
               );
-              count++;
-            } else if (mode === 'backup') {
-              throw new AutoResetSignal(
-                `backup replica at watermark ${sub.watermark} is behind change db: ${entry.watermark})`,
-              );
-            } else {
-              lc.warn?.(
-                `rejecting subscriber at watermark ${sub.watermark} (earliest watermark: ${entry.watermark})`,
-              );
-              sub.close(
-                ErrorType.WatermarkTooOld,
-                `earliest supported watermark is ${entry.watermark} (requested ${sub.watermark})`,
-              );
-              return;
             }
+
+            for (const entry of entries) {
+              if (entry.watermark === sub.watermark) {
+                // This should be the first entry.
+                // Catchup starts from *after* the watermark.
+                watermarkFound = true;
+              } else if (watermarkFound) {
+                lastBatchConsumed = sub.catchup(
+                  reconstructWatermarkedChange(entry),
+                );
+                count++;
+              } else if (mode === 'backup') {
+                throw new AutoResetSignal(
+                  `backup replica at watermark ${sub.watermark} is behind change db: ${entry.watermark})`,
+                );
+              } else {
+                lc.warn?.(
+                  `rejecting subscriber at watermark ${sub.watermark} (earliest watermark: ${entry.watermark})`,
+                );
+                sub.close(
+                  ErrorType.WatermarkTooOld,
+                  `earliest supported watermark is ${entry.watermark} (requested ${sub.watermark})`,
+                );
+                return;
+              }
+            }
+          } finally {
+            // Track the db's read of the next chunk of changes.
+            catchupProgressed = this.#progressMonitor.trackTask({
+              task: 'catchup',
+              subscriber: sub.id,
+              entriesReceived,
+            });
           }
         }
+        catchupProgressed();
+
         if (watermarkFound) {
           await lastBatchConsumed;
           lc.info?.(
@@ -907,6 +1016,8 @@ export class Storer implements Service {
         this.#onFatal(err);
       }
       sub.fail(err);
+    } finally {
+      catchupProgressed();
     }
   }
 
@@ -1031,6 +1142,7 @@ export class Storer implements Service {
    */
   async stop() {
     if (this.#running) {
+      this.#progressMonitor.stop();
       this.#lc.info?.(`draining ${this.#queue.size()} changeLog entries`);
       this.abort(); // for cleanliness, abort any open transactions
       this.#queue.enqueue('stop');
@@ -1121,5 +1233,92 @@ export class PurgeLocker {
       `locked watermark ${watermark} from being purged from replica@${replicaVersion}`,
     );
     return new PurgeLock(this.#lc, tx, replicaVersion, watermark);
+  }
+}
+
+// A TaskKey, keyed by identity, representing an db task monitored by the
+// ProgressMonitor. The contents are stringified in error messages if the
+// task fails to make progress for more than a failure threshold interval.
+type TaskKey = JSONObject;
+
+type TaskDoneFn = () => void;
+
+/**
+ * Periodic monitor for detecting the pathological condition in which a db
+ * query hangs forever because of a connection problem, such as a half-closed
+ * socket.
+ *
+ * Use this for db calls that recur or accumulate progress within a single
+ * logical operation on the main storer loop (e.g. the queue-processing loop,
+ * or a multi-batch catchup read), where "no progress for N ms" is the
+ * meaningful signal. For a one-off db call -- including ones made before
+ * {@link Storer.run} starts this monitor's polling -- use a plain timeout
+ * (see `Storer.#withTimeout`) instead.
+ *
+ * The failure handler should stop the server. The ProgressMonitor will
+ * assume this and stop itself after calling it.
+ *
+ * Internal to the Storer, but exported for testing.
+ */
+export class ProgressMonitor {
+  readonly #lc: LogContext;
+  readonly #failureThresholdMs;
+  readonly #onFailure: (err: Error) => void;
+  readonly #taskUpdates = new Map<TaskKey, Date>();
+
+  #timer: NodeJS.Timeout | undefined;
+
+  constructor(
+    lc: LogContext,
+    failureThresholdMs: number,
+    onFailure: (err: Error) => void,
+  ) {
+    this.#lc = lc.withContext('component', 'storer-progress-monitor');
+    this.#failureThresholdMs = failureThresholdMs;
+    this.#onFailure = onFailure;
+  }
+
+  start() {
+    clearInterval(this.#timer);
+    this.#timer = setInterval(
+      () => this.checkTaskProgress(new Date()),
+      this.#failureThresholdMs,
+    ).unref();
+  }
+
+  // Called by an internal periodic timer, but exported for testing.
+  checkTaskProgress(now: Date) {
+    for (const [task, lastUpdate] of this.#taskUpdates.entries()) {
+      if (now.getTime() - lastUpdate.getTime() >= this.#failureThresholdMs) {
+        this.#lc.error?.(
+          `Last task update was more than ${this.#failureThresholdMs}ms ago`,
+          {task, lastUpdate},
+        );
+        this.#onFailure(
+          new Error(
+            `Task failed to progress for over ${this.#failureThresholdMs}ms: ${BigIntJSON.stringify(task)}`,
+          ),
+        );
+        this.stop();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Starts a task to be tracked.
+   *
+   * @return a callback to invoke when the task is done.
+   */
+  trackTask(task: TaskKey, now = new Date()): TaskDoneFn {
+    this.#taskUpdates.set(task, now);
+    return () => {
+      this.#taskUpdates.delete(task);
+    };
+  }
+
+  stop() {
+    clearInterval(this.#timer);
+    this.#taskUpdates.clear();
   }
 }
